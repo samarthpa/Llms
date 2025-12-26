@@ -3,30 +3,165 @@ from analyzer import ContentAnalyzer
 from urllib.parse import urlparse
 from llm_service import LLMService
 from metadata_extractor import MetadataExtractor
+from bs4 import BeautifulSoup
+import logging
+import requests
+import re
+
+logger = logging.getLogger(__name__)
 
 class LLMsTxtGenerator:
-    def __init__(self, use_llm: bool = True):
+    def __init__(self, use_llm: bool = True, include_blog: bool = False, 
+                 include_sitemaps: bool = False, max_core_pages: int = 6, 
+                 max_key_features: int = 8):
         self.analyzer = ContentAnalyzer(use_llm=use_llm)
         self.llm_service = LLMService() if use_llm else None
         self.metadata_extractor = MetadataExtractor()
-    
+        self.session = requests.Session()
+        
+        # Generator Options
+        self.include_blog = include_blog
+        self.include_sitemaps = include_sitemaps
+        self.max_core_pages = max_core_pages
+        self.max_key_features = max_key_features
+        self.allowed_urls = set()
+
+    def _normalize_url(self, url: str, base_url: str = "") -> str:
+        if not url:
+            return ""
+        if url.startswith('/') and base_url:
+            from urllib.parse import urljoin
+            url = urljoin(base_url, url)
+        parsed = urlparse(url)
+        # strip query + fragment so comparisons are consistent
+        path = (parsed.path or "").rstrip('/')
+        return f"{parsed.netloc.lower()}{path}"
+
+    def _segments_no_locale(self, url: str) -> List[str]:
+        segs = self._path_segments(url)
+        if segs and self._is_locale_segment(segs[0]):
+            return segs[1:]
+        return segs
+
+    def _normalize_text_for_compare(self, text: str) -> str:
+        """Normalize text for equality checks (lowercase, collapse whitespace, strip trailing punctuation)."""
+        if not text:
+            return ""
+        t = text.strip().lower()
+        t = re.sub(r'\s+', ' ', t)
+        t = t.strip().rstrip('.!?:;,"\'')
+        return t
+
+    def is_legal_page(self, url: str) -> bool:
+        """Heuristic: legal/policy pages (locale-stripped, segment-based)."""
+        segs = self._segments_no_locale(url)
+        legal_tokens = {"terms", "privacy", "cookie", "cookies", "legal", "security", "policy"}
+        return any(any(tok in seg for tok in legal_tokens) for seg in segs)
+
+    def is_content_page(self, url: str) -> bool:
+        """Heuristic: blog/resources/guide/content hubs (locale-stripped, segment-based)."""
+        segs = self._segments_no_locale(url)
+        content_tokens = {"blog", "post", "article", "topic", "topics", "resource", "resources", "guide", "free-guide", "ideas", "tips"}
+        return any(any(tok in seg for tok in content_tokens) for seg in segs)
+
+    def _verify_sitemap(self, url: str) -> bool:
+        """Verify sitemap is XML and reachable."""
+        try:
+            resp = self.session.get(url, timeout=5, stream=True)
+            if resp.status_code == 200:
+                content_type = resp.headers.get('Content-Type', '').lower()
+                if 'xml' in content_type:
+                    return True
+                # Check body start if content-type is missing or vague
+                chunk = next(resp.iter_content(chunk_size=512), b"").decode('utf-8', 'ignore')
+                if '<?xml' in chunk or '<urlset' in chunk or '<sitemapindex' in chunk:
+                    return True
+        except Exception:
+            pass
+        return False
+
+    def _path_segments(self, url: str) -> List[str]:
+        path = urlparse(url).path.strip('/')
+        return [s for s in path.split('/') if s]
+
+    def _path_depth(self, url: str) -> int:
+        return len(self._path_segments(url))
+
+    def _looks_like_article(self, url: str) -> bool:
+        """Heuristics to detect articles/long-tail content."""
+        segments = self._path_segments(url)
+        if not segments:
+            return False
+            
+        slug = segments[-1]
+        # Heuristic: slug length > 40 is often an article title
+        if len(slug) > 40:
+            return True
+            
+        # Heuristic: contains year/month/day patterns (e.g., /2023/05/page)
+        if any(re.match(r'^\d{4}$|^\d{2}$', s) for s in segments):
+            return True
+            
+        # Heuristic: deep nesting > 3 segments is usually deep content
+        if len(segments) > 3:
+            return True
+            
+        return False
+
+    def _score_core_page(self, page: Dict) -> int:
+        """Score page importance for Core Pages selection."""
+        url = page['url']
+        path = urlparse(url).path.lower().rstrip('/')
+        
+        if path == '' or path == '/':
+            return 100
+            
+        score = 0
+        # Only “intent” pages should score highly for Core Pages.
+        keywords = {
+            '/pricing': 90,
+            '/about': 85,
+            '/contact': 80,
+            '/help': 75,
+            '/support': 75,
+            '/docs': 70,
+            '/documentation': 70,
+            '/terms': 60,
+            '/privacy': 60,
+        }
+        
+        for kw, val in keywords.items():
+            if kw in path:
+                score += val
+                break
+                
+        # Prefer shallower paths
+        depth = self._path_depth(url)
+        score += (10 - depth) * 2
+        
+        return score
+
     def generate(self, pages: List[Dict]) -> str:
-        """Generate llms.txt content following the exact llms.txt specification"""
         if not pages:
             return "# Website\n\n> No content found.\n"
         
+        homepage_url = self._get_homepage_url(pages)
+        self.allowed_urls = {self._normalize_url(p['url']) for p in pages}
+        
+        # Verified Sitemaps only if enabled
+        sitemaps = []
+        if self.include_sitemaps:
+            candidates = [f"{homepage_url.rstrip('/')}/sitemap.xml", f"{homepage_url.rstrip('/')}/sitemap_index.xml"]
+            for sm in candidates:
+                if self._verify_sitemap(sm):
+                    sitemaps.append(sm)
+                    self.allowed_urls.add(self._normalize_url(sm))
+
+        pages = self._dedupe_pages_by_canonical_url(pages)
         website_name = self.analyzer.extract_website_name(pages)
         summary = self.analyzer.extract_summary(pages)
-        homepage_url = self._get_homepage_url(pages)
         
-        homepage = None
-        for page in pages:
-            parsed = urlparse(page['url'])
-            if parsed.path in ['/', '/index', '/index.html']:
-                homepage = page
-                break
-        if not homepage and pages:
-            homepage = pages[0]
+        homepage = next((p for p in pages if urlparse(p['url']).path in ['/', '/index', '/index.html']), pages[0])
         
         author_info = None
         contact_links = []
@@ -34,355 +169,243 @@ class LLMsTxtGenerator:
         languages = []
         main_nav = []
         
-        if homepage:
-            try:
-                author_info = self.metadata_extractor.extract_author_info([homepage])
-                contact_links = self.metadata_extractor.extract_contact_links([homepage])
-                licensing = self.metadata_extractor.extract_licensing([homepage])
-                languages = self.metadata_extractor.extract_languages([homepage])
-                main_nav = self.metadata_extractor.extract_main_navigation([homepage])
-            except Exception:
-                pass
-        
-        categorized = self.analyzer.group_pages_by_category(pages)
+        try:
+            author_info = self.metadata_extractor.extract_author_info([homepage])
+            contact_links = self.metadata_extractor.extract_contact_links([homepage])
+            licensing = self.metadata_extractor.extract_licensing([homepage])
+            languages = self.metadata_extractor.extract_languages(pages) # Use all pages for lang
+            main_nav = self.metadata_extractor.extract_main_navigation([homepage])
+        except Exception:
+            pass
         
         lines = []
-        
         lines.append(f"# {website_name}\n")
         
         blockquote_text = self._get_blockquote_text(pages, author_info, summary, homepage_url)
         lines.append(f"> {blockquote_text}\n")
         
         detail_sections = []
-        
-        if self.llm_service and self.llm_service.is_available():
+        blockquote_norm = self._normalize_text_for_compare(blockquote_text)
+
+        def _add_detail(text: str):
+            if not text:
+                return
+            candidate = text.strip()
+            if not candidate:
+                return
+            # Prevent duplicate one-liner: don't repeat blockquote as a paragraph
+            if self._normalize_text_for_compare(candidate) == blockquote_norm:
+                return
+            # Avoid duplicates among detail sections too
+            if any(self._normalize_text_for_compare(s) == self._normalize_text_for_compare(candidate) for s in detail_sections):
+                return
+            detail_sections.append(candidate)
+
+        # If include_blog=False, avoid LLM summary entirely and stick to homepage evidence.
+        if self.include_blog and self.llm_service and self.llm_service.is_available():
             try:
                 detailed_info = self.llm_service.generate_website_summary(pages)
                 if detailed_info and len(detailed_info) > 100:
-                    detail_sections.append(detailed_info)
+                    _add_detail(detailed_info)
             except:
                 pass
-        
-        if not detail_sections:
-            homepage = None
-            for page in pages:
-                parsed = urlparse(page['url'])
-                if parsed.path in ['/', '/index', '/index.html']:
-                    homepage = page
-                    break
-            
-            if homepage:
-                desc = homepage.get('description', '')
-                if desc and len(desc) > 100:
-                    detail_sections.append(desc)
-                elif homepage.get('raw_text'):
-                    text = homepage.get('raw_text', '')[:1000]
-                    sentences = [s.strip() for s in text.split('.') if s.strip() and len(s.strip()) > 30]
-                    if sentences:
-                        detail_sections.append('. '.join(sentences[:3]) + '.')
-        
-        if author_info and author_info.get('bio'):
-            detail_sections.append(author_info['bio'])
+
+        if homepage:
+            desc = homepage.get('description', '')
+            if desc and len(desc) > 100:
+                _add_detail(desc)
+            elif homepage.get('raw_text'):
+                raw = (homepage.get('raw_text') or '').strip()
+                if raw:
+                    _add_detail(raw[:400])
         
         if licensing:
-            if licensing.startswith('http'):
-                detail_sections.append(f"All pages under this site ({homepage_url or 'this site'}) are licensed under [{licensing.split('/')[-1]}]({licensing}).")
-            else:
-                detail_sections.append(licensing)
-        
-        if languages and len(languages) > 1:
-            detail_sections.append(f"Languages supported: {', '.join(languages)}.")
+            _add_detail(f"Licensed under: {licensing}")
+            
+        # Do not print languages unless strong signals exist AND it's a small set (<= 5).
+        if languages and len(languages) <= 5:
+            _add_detail(f"Languages supported: {', '.join(languages)}.")
         
         if detail_sections:
             lines.append("")
             for section in detail_sections:
                 lines.append(f"{section}\n")
         
-        core_pages = []
-        homepage = None
-        for page in pages:
-            parsed = urlparse(page['url'])
-            if parsed.path in ['/', '/index', '/index.html']:
-                homepage = page
-                core_pages.append(page)
-                break
-        
-        if main_nav:
-            for nav_item in main_nav[:10]:
-                nav_url = nav_item.get('url', '')
-                for page in pages:
-                    if page['url'] == nav_url and page not in core_pages:
-                        core_pages.append(page)
-                        break
-        
-        important_keywords = ['faq', 'pricing', 'about', 'demo', 'features', 'contact']
-        for page in pages:
-            if page in core_pages:
+        # --- CORE PAGES SELECTION ---
+        # Locale-stripped intent-only core pages; exclude legal/policy and content hubs.
+        intent_first_segments = {'pricing', 'about', 'contact', 'help', 'support', 'docs', 'documentation'}
+
+        core_candidates: List[Dict] = []
+        for p in pages:
+            url = p['url']
+            path = urlparse(url).path.lower()
+            is_home = path in ['', '/']
+            segs = self._segments_no_locale(url)
+
+            if not is_home and len(segs) > 2:
                 continue
-            parsed = urlparse(page['url'])
-            path_lower = parsed.path.lower()
-            if any(keyword in path_lower for keyword in important_keywords):
-                if len(core_pages) < 10:
-                    core_pages.append(page)
+            if self.is_content_page(url) or self.is_legal_page(url):
+                continue
+
+            if is_home:
+                core_candidates.append(p)
+                continue
+
+            if segs and segs[0] in intent_first_segments:
+                core_candidates.append(p)
         
-        if core_pages:
+        # Score and pick top max_core_pages
+        core_candidates.sort(key=lambda x: self._score_core_page(x), reverse=True)
+        selected_core = core_candidates[:self.max_core_pages]
+        
+        if selected_core:
             lines.append("\n## Core Pages\n")
-            sorted_core = self._sort_pages_by_importance(core_pages)
-            for page in sorted_core:
+            for page in selected_core:
                 self._add_page_link(lines, page)
             lines.append("")
+
+        # --- KEY FEATURES ---
+        categorized = self.analyzer.group_pages_by_category(pages)
+        features = categorized.get('services', []) + categorized.get('products', [])
         
-        if 'services' in categorized and categorized['services']:
+        filtered_features: List[Dict] = []
+        seen_feature_urls: set = set()
+        feature_exclude_keywords = ['generator', 'ideas', 'design-', 'room-', 'home-']
+        bad_slug_tokens = {"free", "guide", "ideas", "generator", "tool", "tips", "2024", "2025"}
+        
+        for f in features:
+            url = f['url']
+            segs = self._segments_no_locale(url)
+            slug = segs[-1] if segs else ""
+            
+            if self._normalize_url(url, homepage_url) in seen_feature_urls:
+                continue
+            if f in selected_core:
+                continue
+
+            # Exclude legal/policy and content hubs
+            if self.is_legal_page(url) or self.is_content_page(url):
+                continue
+
+            # Exclude SEO long-tail pages
+            if len(slug) > 25:
+                continue
+            if any(tok in slug.lower() for tok in bad_slug_tokens):
+                continue
+            if any(char.isdigit() for char in slug):
+                continue
+            if len(segs) >= 3:
+                continue
+            if any(kw in url.lower() for kw in feature_exclude_keywords):
+                continue
+
+            # Require evidence (description or raw_text)
+            desc = (f.get('description') or '').strip()
+            raw = (f.get('raw_text') or '').strip()
+            if len(desc) < 40 and len(raw) < 300:
+                continue
+
+            filtered_features.append(f)
+            seen_feature_urls.add(self._normalize_url(url, homepage_url))
+        
+        if filtered_features:
             lines.append("\n## Key Features\n")
-            sorted_pages = self._sort_pages_by_importance(categorized['services'])
-            for page in sorted_pages[:10]:
+            cap = min(self.max_key_features, 5)
+            for page in filtered_features[:cap]:
                 self._add_page_link(lines, page)
             lines.append("")
-        elif 'products' in categorized and categorized['products']:
-            lines.append("\n## Key Features\n")
-            sorted_pages = self._sort_pages_by_importance(categorized['products'])
-            for page in sorted_pages[:10]:
-                self._add_page_link(lines, page)
-            lines.append("")
-        
-        integration_pages = [p for p in pages if 'integration' in p.get('url', '').lower() or 'integration' in p.get('title', '').lower()]
-        if integration_pages:
-            lines.append("\n## Integrations\n")
-            for page in integration_pages[:10]:
-                self._add_page_link(lines, page)
-            lines.append("")
-        
-        if 'blog' in categorized and categorized['blog']:
-            blog_pages = categorized['blog']
+            
+        # --- BLOG SECTION ---
+        if self.include_blog and categorized.get('blog'):
             lines.append("\n## Blog\n")
+            for page in categorized['blog'][:5]:
+                self._add_page_link(lines, page)
+            lines.append("")
             
-            main_blog = None
-            for page in blog_pages:
-                parsed = urlparse(page['url'])
-                path = parsed.path.rstrip('/')
-                if path in ['/blog', '/blog/']:
-                    main_blog = page
-                    break
+        # --- SITEMAPS ---
+        if sitemaps:
+            lines.append("\n## Sitemaps\n")
+            for sm in sitemaps:
+                lines.append(f"- [Sitemap]({sm})")
+            lines.append("")
             
-            if not main_blog and blog_pages:
-                main_blog = blog_pages[0]
-            
-            if main_blog:
-                desc = main_blog.get('description', 'Technical articles and posts')
-                lines.append(f"- [Blog]({main_blog['url']}): {desc}")
-            
-            other_blog_pages = [p for p in blog_pages if p != main_blog] if main_blog else blog_pages
-            for page in other_blog_pages[:5]:
-                self._add_page_link(lines, page)
-            lines.append("")
-        
-        if 'documentation' in categorized and categorized['documentation']:
-            lines.append("\n## Documentation\n")
-            sorted_pages = self._sort_pages_by_importance(categorized['documentation'])
-            for page in sorted_pages[:15]:
-                self._add_page_link(lines, page)
-            lines.append("")
-        
-        if 'about' in categorized and categorized['about']:
-            lines.append("\n## About\n")
-            sorted_pages = self._sort_pages_by_importance(categorized['about'])
-            for page in sorted_pages[:5]:
-                self._add_page_link(lines, page)
-            lines.append("")
-        
-        if contact_links:
-            lines.append("\n## Contact\n")
-            for link in contact_links[:10]:
-                platform = link.get('platform', '').title()
-                url = link.get('url', '')
-                text = link.get('text', platform)
-                
-                if platform.lower() == 'twitter':
-                    platform = 'Twitter/X'
-                elif platform.lower() == 'ko-fi':
-                    platform = 'Ko-fi'
-                
-                lines.append(f"- [{platform}]({url}): {text}")
-            lines.append("")
-        elif 'contact' in categorized and categorized['contact']:
-            lines.append("\n## Contact\n")
-            sorted_pages = self._sort_pages_by_importance(categorized['contact'])
-            for page in sorted_pages[:5]:
-                self._add_page_link(lines, page)
-            lines.append("")
-        
-        optional_pages = self._get_optional_pages(categorized)
-        if optional_pages:
-            lines.append("\n## Optional\n")
-            for page in optional_pages[:15]:
-                self._add_page_link(lines, page)
-            lines.append("")
-        
+        # FINAL VALIDATION
         llms_content = '\n'.join(lines)
-        
-        if self.llm_service and self.llm_service.is_available():
-            try:
-                improved = self.llm_service.improve_llms_txt_structure(llms_content, pages)
-                if improved and len(improved) > 100:
-                    return improved
-            except Exception:
-                pass
-        
-        return llms_content
-    
+        validated_lines = []
+        home_netloc = urlparse(homepage_url).netloc
+        for line in llms_content.split('\n'):
+            matches = re.findall(r'\[.*?\]\((.*?)\)', line)
+            if matches:
+                all_allowed = True
+                for link_url in matches:
+                    if link_url.startswith('#'): continue
+                    parsed_link = urlparse(link_url)
+                    if parsed_link.netloc == home_netloc or (not parsed_link.netloc and parsed_link.path):
+                        norm = self._normalize_url(link_url, homepage_url)
+                        if norm not in self.allowed_urls:
+                            all_allowed = False
+                            break
+                if all_allowed: validated_lines.append(line)
+            else:
+                validated_lines.append(line)
+        return '\n'.join(validated_lines)
+
     def _get_homepage_url(self, pages: List[Dict]) -> str:
-        """Get the homepage URL"""
         for page in pages:
             parsed = urlparse(page['url'])
             if parsed.path in ['/', '/index', '/index.html']:
                 return page['url']
         return pages[0]['url'] if pages else ''
-    
-    def _sort_pages_by_importance(self, pages: List[Dict]) -> List[Dict]:
-        """Sort pages by importance (homepage first, then by URL depth)"""
-        return sorted(
-            pages,
-            key=lambda p: (
-                0 if urlparse(p['url']).path in ['/', '/index'] else 1,
-                urlparse(p['url']).path.count('/')
-            )
-        )
-    
+
     def _add_page_link(self, lines: List[str], page: Dict):
-        """Add a page link following llms.txt format: [name](url): description"""
         title = page.get('title', 'Untitled')
         url = page['url']
+        if self._normalize_url(url) not in self.allowed_urls:
+            return
         description = page.get('description', '')
-        
         if description:
             desc = description.strip()
-            if len(desc) > 150:
-                desc = desc[:147] + '...'
+            if len(desc) > 150: desc = desc[:147] + '...'
             lines.append(f"- [{title}]({url}): {desc}")
         else:
             lines.append(f"- [{title}]({url})")
-    
-    def _get_optional_pages(self, categorized: Dict) -> List[Dict]:
-        """Get optional/secondary pages"""
-        optional = []
-        
-        if 'other' in categorized:
-            optional.extend(categorized['other'][:5])
-        
-        return optional
-    
-    def _get_blockquote_text(self, pages: List[Dict], author_info: Optional[Dict], summary: str, homepage_url: str) -> str:
-        """Get concise blockquote text"""
-        if author_info and author_info.get('title'):
-            title = author_info['title']
-            if len(title) < 200:
-                return title
-        
-        homepage = None
-        for page in pages:
-            parsed = urlparse(page['url'])
-            if parsed.path in ['/', '/index', '/index.html']:
-                homepage = page
-                break
-        
-        if homepage:
-            description = homepage.get('description', '')
-            if description and 50 < len(description) < 200:
-                return description
-            
-            raw_text = homepage.get('raw_text', '')
-            if raw_text:
-                sentences = [s.strip() for s in raw_text.split('.') if s.strip() and len(s.strip()) > 30]
-                if sentences:
-                    text = sentences[0]
-                    if len(text) < 200:
-                        return text + '.' if not text.endswith('.') else text
-        
-        if summary and 50 < len(summary) < 200:
-            return summary
-        
-        return homepage_url if homepage_url else (summary[:150] if summary else "A website providing various services and information.")
-    
-    def _get_rss_feeds(self, pages: List[Dict]) -> List[str]:
-        """Get RSS/Atom feed URLs"""
-        feeds = []
-        
-        # Check if we found feeds during crawling
-        for page in pages:
-            html_content = page.get('html_content', '')
-            if not html_content:
-                continue
-            
-            try:
-                from bs4 import BeautifulSoup
-                soup = BeautifulSoup(html_content, 'html.parser')
-            except ImportError:
-                continue
-            
-            # Look for feed links
-            for link in soup.find_all('link', type=lambda x: x and ('rss' in x.lower() or 'atom' in x.lower())):
-                href = link.get('href')
-                if href:
-                    from urllib.parse import urljoin
-                    feed_url = urljoin(page['url'], href)
-                    if feed_url not in feeds:
-                        feeds.append(feed_url)
-        
-        # Also try common feed paths
-        if not feeds and pages:
-            base_url = pages[0]['url']
-            parsed = urlparse(base_url)
-            base = f"{parsed.scheme}://{parsed.netloc}"
-            
-            common_feeds = [
-                '/feed',
-                '/rss',
-                '/atom',
-                '/feed.xml',
-                '/rss.xml',
-                '/atom.xml',
-                '/blog/feed',
-                '/blog/rss',
-                '/blog/index.xml',
-                '/feeds/all.rss'
-            ]
-            
-            for path in common_feeds:
-                feeds.append(f"{base}{path}")
-        
-        return feeds[:3]  # Return up to 3 feeds
-    
-    def _get_sitemap_urls(self, pages: List[Dict]) -> List[str]:
-        """Get sitemap URLs if available"""
-        if not pages:
-            return []
-        
-        base_url = pages[0]['url']
-        parsed = urlparse(base_url)
-        base = f"{parsed.scheme}://{parsed.netloc}"
-        
-        sitemap_urls = []
-        sitemap_paths = ['/sitemap.xml', '/sitemap_index.xml']
-        
-        for path in sitemap_paths:
-            sitemap_urls.append(f"{base}{path}")
-        
-        return sitemap_urls
-    
-    def _format_category_name(self, category: str) -> str:
-        """Format category name for section heading"""
-        category_names = {
-            'home': 'Home',
-            'about': 'About',
-            'contact': 'Contact',
-            'services': 'Services',
-            'products': 'Products',
-            'blog': 'Blog',
-            'pricing': 'Pricing',
-            'faq': 'FAQ',
-            'careers': 'Careers',
-            'documentation': 'Documentation',
-            'other': 'Pages'
-        }
-        return category_names.get(category, category.title())
 
+    def _get_blockquote_text(self, pages: List[Dict], author_info: Optional[Dict], summary: str, homepage_url: str) -> str:
+        homepage = next((p for p in pages if urlparse(p['url']).path in ['/', '/index']), pages[0] if pages else None)
+        if homepage:
+            desc = (homepage.get('description') or '').strip()
+            if 50 < len(desc) < 220: return desc
+        if self.llm_service and self.llm_service.is_available() and homepage:
+            one_liner = self.llm_service.generate_one_liner(
+                self.analyzer.extract_website_name(pages), 
+                homepage.get('title', ''), 
+                homepage.get('description', ''), 
+                homepage.get('raw_text', '')
+            )
+            if one_liner: return one_liner
+        return f"Official site for {homepage_url.split('//')[-1].split('/')[0] if homepage_url else 'this website'}."
+
+    def _is_locale_segment(self, seg: str) -> bool:
+        if not seg: return False
+        return bool(re.match(r'^[a-z]{2}$', seg) or re.match(r'^[a-z]{2}-[A-Z]{2}$', seg) or re.match(r'^[a-z]{2}-[a-z]{2}$', seg) or re.match(r'^[a-z]{3}$', seg))
+
+    def _strip_locale(self, url: str) -> str:
+        parsed = urlparse(url)
+        segments = parsed.path.strip('/').split('/')
+        if segments and self._is_locale_segment(segments[0]):
+            return f"{parsed.netloc}/{'/'.join(segments[1:])}".rstrip('/')
+        return f"{parsed.netloc}/{parsed.path.strip('/')}".rstrip('/')
+
+    def _dedupe_pages_by_canonical_url(self, pages: List[Dict]) -> List[Dict]:
+        groups = {}
+        for p in pages:
+            key = self._strip_locale(p['url'])
+            groups.setdefault(key, []).append(p)
+        deduped = []
+        for members in groups.values():
+            if len(members) == 1:
+                deduped.append(members[0])
+            else:
+                english = [m for m in members if any(seg.startswith('en') and self._is_locale_segment(seg) for seg in self._path_segments(m['url']))]
+                deduped.append(min(english if english else members, key=lambda x: (x['url'].count('/'), len(x['url']))))
+        return deduped

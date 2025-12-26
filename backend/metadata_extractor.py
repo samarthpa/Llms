@@ -11,7 +11,6 @@ class MetadataExtractor:
     
     def extract_author_info(self, pages: List[Dict]) -> Optional[Dict]:
         """Extract author information from about pages"""
-        # Find about page
         about_page = None
         for page in pages:
             parsed = urlparse(page['url'])
@@ -127,37 +126,40 @@ class MetadataExtractor:
         return None
     
     def extract_languages(self, pages: List[Dict]) -> List[str]:
-        """Extract supported languages"""
-        languages = []
-        
-        # Look for language indicators in HTML
+        """Extract supported languages from strong signals only.
+
+        Allowed evidence sources:
+        - <html lang="...">
+        - <link rel="alternate" hreflang="..."> (excluding x-default)
+
+        Returns primary codes only (e.g., en-US -> en) and dedupes.
+        """
+        languages: List[str] = []
+
+        def _add(code: str):
+            code = (code or "").strip().lower()
+            if not code or code == "x-default":
+                return
+            primary = code.split("-")[0]
+            if len(primary) < 2:
+                return
+            if primary not in languages:
+                languages.append(primary)
+
         for page in pages:
             html_content = page.get('html_content', '')
             if not html_content:
                 continue
-            
+
             soup = BeautifulSoup(html_content, 'html.parser')
-            
+
             html_tag = soup.find('html')
             if html_tag and html_tag.get('lang'):
-                lang = html_tag.get('lang')
-                if lang not in languages:
-                    languages.append(lang)
-            
-            for link in soup.find_all('a', href=True):
-                href = link.get('href', '').lower()
-                text = link.get_text().strip()
-                if 'lang=' in href or '/en/' in href or '/es/' in href:
-                    if '/en/' in href:
-                        if 'English' not in languages:
-                            languages.append('English')
-                    elif '/es/' in href:
-                        if 'Spanish' not in languages:
-                            languages.append('Spanish')
-        
-        if not languages:
-            languages = ['English']
-        
+                _add(html_tag.get('lang'))
+
+            for link in soup.find_all('link', rel=lambda v: v and 'alternate' in v, hreflang=True):
+                _add(link.get('hreflang'))
+
         return languages
     
     def extract_main_navigation(self, pages: List[Dict]) -> List[Dict]:
@@ -217,4 +219,3 @@ class MetadataExtractor:
                 all_main[url] = item
         
         return list(all_main.values())
-

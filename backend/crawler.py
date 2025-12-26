@@ -268,6 +268,58 @@ class WebCrawler:
         
         return nav_links, other_links
     
+    def _is_locale_segment(self, seg: str) -> bool:
+        """Generic locale detection for path segments."""
+        if not seg:
+            return False
+        # Matches en, fr, de, af, ar
+        if re.match(r'^[a-z]{2}$', seg):
+            return True
+        # Matches en-US, zh-CN, zh-cn, zh-TW
+        if re.match(r'^[a-z]{2}-[A-Z]{2}$', seg) or re.match(r'^[a-z]{2}-[a-z]{2}$', seg):
+            return True
+        # Matches eng, zho (3-letter codes)
+        if re.match(r'^[a-z]{3}$', seg):
+            return True
+        return False
+
+    def _strip_locale(self, url: str) -> str:
+        """Strip locale segment from start of path for canonical grouping."""
+        parsed = urlparse(url)
+        path = parsed.path.strip('/')
+        segments = path.split('/')
+        if segments and self._is_locale_segment(segments[0]):
+            new_path = '/' + '/'.join(segments[1:])
+            return f"{parsed.netloc}{new_path.rstrip('/')}"
+        return f"{parsed.netloc}/{path.rstrip('/')}"
+
+    def _dedupe_urls_by_locale(self, urls: List[str]) -> List[str]:
+        """Group URLs by canonical path (no locale) and pick the best representative."""
+        if not urls:
+            return []
+        groups = {}
+        for url in urls:
+            key = self._strip_locale(url)
+            if key not in groups:
+                groups[key] = []
+            groups[key].append(url)
+        deduped = []
+        for key, members in groups.items():
+            if len(members) == 1:
+                deduped.append(members[0])
+                continue
+            # Pick best representative
+            # 1. Prefer English variants
+            english = [u for u in members if any(seg.startswith('en') and self._is_locale_segment(seg) 
+                                                 for seg in urlparse(u).path.strip('/').split('/'))]
+            if english:
+                deduped.append(min(english, key=lambda x: (x.count('/'), len(x))))
+                continue
+            # 2. Prefer shortest path
+            best = min(members, key=lambda x: (x.count('/'), len(x)))
+            deduped.append(best)
+        return deduped
+
     def crawl(self) -> List[Dict]:
         """
         Main crawling method using priority-tier BFS.
@@ -285,7 +337,9 @@ class WebCrawler:
         
         sitemap_urls = self._parse_sitemap()
         if sitemap_urls:
-            for url in sitemap_urls[:self.max_pages]:
+            # Deduplicate sitemap URLs by locale to reduce waste
+            deduped_sitemaps = self._dedupe_urls_by_locale(sitemap_urls)
+            for url in deduped_sitemaps[:self.max_pages]:
                 normalized = normalize_url(url)
                 if normalized not in self.visited_urls and normalized not in queued_urls and self._can_fetch(normalized):
                     nav_queues[0].append(normalized)
