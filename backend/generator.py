@@ -15,11 +15,10 @@ class LLMsTxtGenerator:
                  include_sitemaps: bool = False, max_core_pages: int = 6, 
                  max_key_features: int = 8):
         self.analyzer = ContentAnalyzer(use_llm=use_llm)
-        self.llm_service = LLMService() if use_llm else None
+        self.llm_service = LLMService(require_api_key=True)
         self.metadata_extractor = MetadataExtractor()
         self.session = requests.Session()
         
-        # Generator Options
         self.include_blog = include_blog
         self.include_sitemaps = include_sitemaps
         self.max_core_pages = max_core_pages
@@ -33,7 +32,6 @@ class LLMsTxtGenerator:
             from urllib.parse import urljoin
             url = urljoin(base_url, url)
         parsed = urlparse(url)
-        # strip query + fragment so comparisons are consistent
         path = (parsed.path or "").rstrip('/')
         return f"{parsed.netloc.lower()}{path}"
 
@@ -72,7 +70,6 @@ class LLMsTxtGenerator:
                 content_type = resp.headers.get('Content-Type', '').lower()
                 if 'xml' in content_type:
                     return True
-                # Check body start if content-type is missing or vague
                 chunk = next(resp.iter_content(chunk_size=512), b"").decode('utf-8', 'ignore')
                 if '<?xml' in chunk or '<urlset' in chunk or '<sitemapindex' in chunk:
                     return True
@@ -94,15 +91,12 @@ class LLMsTxtGenerator:
             return False
             
         slug = segments[-1]
-        # Heuristic: slug length > 40 is often an article title
         if len(slug) > 40:
             return True
             
-        # Heuristic: contains year/month/day patterns (e.g., /2023/05/page)
         if any(re.match(r'^\d{4}$|^\d{2}$', s) for s in segments):
             return True
             
-        # Heuristic: deep nesting > 3 segments is usually deep content
         if len(segments) > 3:
             return True
             
@@ -117,7 +111,6 @@ class LLMsTxtGenerator:
             return 100
             
         score = 0
-        # Only “intent” pages should score highly for Core Pages.
         keywords = {
             '/pricing': 90,
             '/about': 85,
@@ -135,7 +128,6 @@ class LLMsTxtGenerator:
                 score += val
                 break
                 
-        # Prefer shallower paths
         depth = self._path_depth(url)
         score += (10 - depth) * 2
         
@@ -144,11 +136,13 @@ class LLMsTxtGenerator:
     def generate(self, pages: List[Dict]) -> str:
         if not pages:
             return "# Website\n\n> No content found.\n"
+
+        pages = [p for p in pages if not p.get("is_soft_404")]
         
         homepage_url = self._get_homepage_url(pages)
         self.allowed_urls = {self._normalize_url(p['url']) for p in pages}
+        allowed_urls_full = sorted({p.get('url') for p in pages if p.get('url')})
         
-        # Verified Sitemaps only if enabled
         sitemaps = []
         if self.include_sitemaps:
             candidates = [f"{homepage_url.rstrip('/')}/sitemap.xml", f"{homepage_url.rstrip('/')}/sitemap_index.xml"]
@@ -156,6 +150,7 @@ class LLMsTxtGenerator:
                 if self._verify_sitemap(sm):
                     sitemaps.append(sm)
                     self.allowed_urls.add(self._normalize_url(sm))
+                    allowed_urls_full.append(sm)
 
         pages = self._dedupe_pages_by_canonical_url(pages)
         website_name = self.analyzer.extract_website_name(pages)
@@ -193,15 +188,12 @@ class LLMsTxtGenerator:
             candidate = text.strip()
             if not candidate:
                 return
-            # Prevent duplicate one-liner: don't repeat blockquote as a paragraph
             if self._normalize_text_for_compare(candidate) == blockquote_norm:
                 return
-            # Avoid duplicates among detail sections too
             if any(self._normalize_text_for_compare(s) == self._normalize_text_for_compare(candidate) for s in detail_sections):
                 return
             detail_sections.append(candidate)
 
-        # If include_blog=False, avoid LLM summary entirely and stick to homepage evidence.
         if self.include_blog and self.llm_service and self.llm_service.is_available():
             try:
                 detailed_info = self.llm_service.generate_website_summary(pages)
@@ -222,7 +214,6 @@ class LLMsTxtGenerator:
         if licensing:
             _add_detail(f"Licensed under: {licensing}")
             
-        # Do not print languages unless strong signals exist AND it's a small set (<= 5).
         if languages and len(languages) <= 5:
             _add_detail(f"Languages supported: {', '.join(languages)}.")
         
@@ -231,8 +222,6 @@ class LLMsTxtGenerator:
             for section in detail_sections:
                 lines.append(f"{section}\n")
         
-        # --- CORE PAGES SELECTION ---
-        # Locale-stripped intent-only core pages; exclude legal/policy and content hubs.
         intent_first_segments = {'pricing', 'about', 'contact', 'help', 'support', 'docs', 'documentation'}
 
         core_candidates: List[Dict] = []
@@ -254,7 +243,6 @@ class LLMsTxtGenerator:
             if segs and segs[0] in intent_first_segments:
                 core_candidates.append(p)
         
-        # Score and pick top max_core_pages
         core_candidates.sort(key=lambda x: self._score_core_page(x), reverse=True)
         selected_core = core_candidates[:self.max_core_pages]
         
@@ -264,7 +252,53 @@ class LLMsTxtGenerator:
                 self._add_page_link(lines, page)
             lines.append("")
 
-        # --- KEY FEATURES ---
+        def _pick_section(pages_in: List[Dict], keywords: List[str], max_items: int = 5) -> List[Dict]:
+            out: List[Dict] = []
+            seen = set()
+            for p in pages_in:
+                u = p.get("url", "")
+                if not u:
+                    continue
+                if self._normalize_url(u) in seen:
+                    continue
+                t = (p.get("title") or "").lower()
+                segs = self._segments_no_locale(u)
+                if any(k in t for k in keywords) or any(k in segs for k in keywords) or any(k in u.lower() for k in keywords):
+                    out.append(p)
+                    seen.add(self._normalize_url(u))
+                if len(out) >= max_items:
+                    break
+            return out
+
+        about_pages = _pick_section(pages, ["about", "team", "company"], 5)
+        services_pages = _pick_section(pages, ["services", "service", "solutions", "offerings"], 5)
+        approach_pages = _pick_section(pages, ["approach", "process", "method", "methodology"], 5)
+        contact_pages = _pick_section(pages, ["contact", "support", "help"], 5)
+
+        if about_pages:
+            lines.append("\n## About\n")
+            for p in about_pages:
+                self._add_page_link(lines, p)
+            lines.append("")
+
+        if services_pages:
+            lines.append("\n## Services\n")
+            for p in services_pages:
+                self._add_page_link(lines, p)
+            lines.append("")
+
+        if approach_pages:
+            lines.append("\n## Approach\n")
+            for p in approach_pages:
+                self._add_page_link(lines, p)
+            lines.append("")
+
+        if contact_pages:
+            lines.append("\n## Contact\n")
+            for p in contact_pages:
+                self._add_page_link(lines, p)
+            lines.append("")
+
         categorized = self.analyzer.group_pages_by_category(pages)
         features = categorized.get('services', []) + categorized.get('products', [])
         
@@ -283,11 +317,9 @@ class LLMsTxtGenerator:
             if f in selected_core:
                 continue
 
-            # Exclude legal/policy and content hubs
             if self.is_legal_page(url) or self.is_content_page(url):
                 continue
 
-            # Exclude SEO long-tail pages
             if len(slug) > 25:
                 continue
             if any(tok in slug.lower() for tok in bad_slug_tokens):
@@ -299,7 +331,6 @@ class LLMsTxtGenerator:
             if any(kw in url.lower() for kw in feature_exclude_keywords):
                 continue
 
-            # Require evidence (description or raw_text)
             desc = (f.get('description') or '').strip()
             raw = (f.get('raw_text') or '').strip()
             if len(desc) < 40 and len(raw) < 300:
@@ -315,22 +346,103 @@ class LLMsTxtGenerator:
                 self._add_page_link(lines, page)
             lines.append("")
             
-        # --- BLOG SECTION ---
         if self.include_blog and categorized.get('blog'):
             lines.append("\n## Blog\n")
             for page in categorized['blog'][:5]:
                 self._add_page_link(lines, page)
             lines.append("")
             
-        # --- SITEMAPS ---
         if sitemaps:
             lines.append("\n## Sitemaps\n")
             for sm in sitemaps:
                 lines.append(f"- [Sitemap]({sm})")
             lines.append("")
             
-        # FINAL VALIDATION
-        llms_content = '\n'.join(lines)
+        outline = '\n'.join(lines)
+
+        evidence_parts: List[str] = []
+        for p in pages[:40]:
+            evidence_parts.append(
+                f"URL: {p.get('url')}\n"
+                f"Title: {p.get('title')}\n"
+                f"Description: {(p.get('best_description') or p.get('description') or '')}\n"
+                f"Text: {(p.get('raw_text') or '')[:600]}\n"
+            )
+        evidence_pack = "\n---\n".join(evidence_parts)
+
+        llms_content = self.llm_service.render_llms_txt(
+            outline_markdown=outline,
+            evidence_pack=evidence_pack,
+            allowed_urls=allowed_urls_full,
+            include_blog=self.include_blog,
+        )
+
+        blockquote_norm = self._normalize_text_for_compare(blockquote_text)
+        sanitized_lines: List[str] = []
+        for line in llms_content.split('\n'):
+            stripped = line.strip()
+            if stripped and not stripped.startswith(('>','-','#')):
+                if self._normalize_text_for_compare(stripped) == blockquote_norm:
+                    continue
+                if not self.include_blog and re.search(r'\b(blog|resources?|guides?|topics?)\b', stripped, re.I):
+                    continue
+            if stripped.lower().startswith("languages supported:"):
+                codes = [c.strip() for c in stripped.split(':', 1)[-1].split(',') if c.strip()]
+                if len(codes) > 5:
+                    continue
+            sanitized_lines.append(line)
+        llms_content = "\n".join(sanitized_lines)
+
+        def _strip_section(lines_in: List[str], heading: str) -> List[str]:
+            out = []
+            skipping = False
+            for ln in lines_in:
+                if ln.strip().lower() == heading.lower():
+                    skipping = True
+                    continue
+                if skipping and ln.startswith("## "):
+                    skipping = False
+                if not skipping:
+                    out.append(ln)
+            return out
+
+        lines_after = llms_content.split("\n")
+        if not self.include_blog:
+            lines_after = _strip_section(lines_after, "## Blog")
+
+        strict_lines: List[str] = []
+        link_line_re = re.compile(r'^-\s+\[[^\]]+\]\([^)]+\)(:\s+.*)?$')
+        paragraphs_allowed = 2
+        paragraphs_used = 0
+        seen_heading = False
+        for ln in lines_after:
+            s = ln.rstrip()
+            st = s.strip()
+            if st == "":
+                strict_lines.append("")
+                continue
+            if st.startswith("# "):
+                strict_lines.append(s)
+                continue
+            if st.startswith(">"):
+                strict_lines.append(s)
+                continue
+            if st.startswith("## "):
+                seen_heading = True
+                strict_lines.append(s)
+                continue
+            if st.startswith("- "):
+                if link_line_re.match(st):
+                    strict_lines.append(s)
+                continue
+            if not seen_heading and not st.startswith("[") and not st.startswith("(") and "http" not in st and paragraphs_used < paragraphs_allowed:
+                strict_lines.append(s)
+                paragraphs_used += 1
+                continue
+            continue
+
+        llms_content = "\n".join(strict_lines)
+
         validated_lines = []
         home_netloc = urlparse(homepage_url).netloc
         for line in llms_content.split('\n'):
@@ -362,7 +474,7 @@ class LLMsTxtGenerator:
         url = page['url']
         if self._normalize_url(url) not in self.allowed_urls:
             return
-        description = page.get('description', '')
+        description = page.get('best_description') or page.get('description', '')
         if description:
             desc = description.strip()
             if len(desc) > 150: desc = desc[:147] + '...'

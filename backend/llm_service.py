@@ -30,7 +30,13 @@ class LLMService:
             return True
         context_lower = context.lower()
         words = re.findall(r'\b[A-Z][a-z]{2,}\b', output)
+        allowed_common = {
+            "This","That","These","Those","The","A","An","And","Or","But","For","With","Without",
+            "In","On","At","By","From","To","Of","As","If","It","Its","We","Our","Official","Website"
+        }
         for word in words:
+            if word in allowed_common:
+                continue
             if word.lower() not in context_lower:
                 logger.warning(f"Hallucination check failed: found '{word}' in output but not in context.")
                 return False
@@ -105,6 +111,61 @@ Improved llms.txt:"""
         except Exception as e:
             logger.error(f"Error improving structure: {e}")
             return llms_content
+
+    def render_llms_txt(self, outline_markdown: str, evidence_pack: str, allowed_urls: List[str], include_blog: bool) -> str:
+        if not self.is_available():
+            raise ValueError("LLMService is required but not available (missing OPENAI_API_KEY).")
+
+        allowed_urls = allowed_urls or []
+        allowed_urls_text = "\n".join(f"- {u}" for u in allowed_urls[:300])
+        blog_rule = "You MAY mention blog/resources/guides only if they appear in the OUTLINE." if include_blog else "Do NOT mention blog/resources/guides/topics anywhere unless they appear in the OUTLINE."
+
+        prompt = f"""You are generating a llms.txt markdown file from evidence.
+
+HARD RULES:
+1) Use ONLY facts/phrases present in the EVIDENCE PACK or OUTLINE. Do NOT add new claims.
+2) Output MUST be valid markdown and MUST start with '#'.
+3) Use ONLY URLs present in the ALLOWED URLS list. Never invent links.
+4) Keep descriptions short and factual. If uncertain, omit the description.
+5) {blog_rule}
+6) Do NOT add a Languages line unless it is already present in the OUTLINE.
+7) Strict formatting: after the initial '# ...' line and the blockquote line starting with '>', you may include up to TWO short plain-text paragraphs (no links) if supported by the EVIDENCE PACK, then the rest must be only:
+   - blank lines
+   - section headings starting with '## '
+   - bullet link lines in the form: '- [Text](URL)' or '- [Text](URL): Description'
+   Do NOT output bare words like 'GitHub' without a bullet link.
+
+ALLOWED URLS:
+{allowed_urls_text}
+
+OUTLINE (structure + candidate links):
+{outline_markdown}
+
+EVIDENCE PACK (extracted site text; may include structured JSON strings):
+{evidence_pack[:12000]}
+
+Return ONLY the final llms.txt markdown content, nothing else.
+"""
+
+        try:
+            response = self.client.chat.completions.create(
+                model="gpt-4o-mini",
+                messages=[
+                    {"role": "system", "content": "You are a strictly evidence-bound technical writer. Do not hallucinate."},
+                    {"role": "user", "content": prompt}
+                ],
+                max_tokens=2000,
+                temperature=0.2
+            )
+            out = response.choices[0].message.content.strip()
+            if not out.startswith("#"):
+                raise ValueError("LLM output was not valid llms.txt (missing leading '#').")
+            if not self._validate_llm_output(out, f"{outline_markdown}\n{evidence_pack}"):
+                raise ValueError("LLM output failed evidence validation.")
+            return out
+        except Exception as e:
+            logger.error(f"Error rendering llms.txt via LLM: {e}")
+            raise
 
     def generate_website_summary(self, pages: List[Dict]) -> str:
         if not self.is_available():
