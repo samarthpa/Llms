@@ -2,9 +2,10 @@ import requests
 from bs4 import BeautifulSoup
 from urllib.parse import urljoin, urlparse
 from urllib.robotparser import RobotFileParser
+from collections import deque, defaultdict
 import time
 import re
-from typing import List, Dict, Set
+from typing import List, Dict, Set, Tuple
 from utils import normalize_url, is_same_domain, get_content_hash, extract_text_from_html
 from llm_service import LLMService
 
@@ -22,6 +23,8 @@ class WebCrawler:
             'User-Agent': 'Mozilla/5.0 (compatible; LLMsTxtGenerator/1.0; +https://llmstxt.org/)'
         })
         self.llm_service = LLMService() if use_llm else None
+        self.section_counts: Dict[str, int] = defaultdict(int)
+        self.defer_counts: Dict[str, int] = {}
         
     def _check_robots_txt(self):
         """Check and parse robots.txt"""
@@ -177,7 +180,6 @@ class WebCrawler:
         if og_title and og_title.get('content'):
             title = og_title.get('content').strip()
         
-        # Extract description
         description = None
         meta_desc = soup.find('meta', attrs={'name': 'description'})
         if meta_desc and meta_desc.get('content'):
@@ -203,49 +205,37 @@ class WebCrawler:
             'raw_text': raw_text
         }
     
-    def crawl(self) -> List[Dict]:
-        """Main crawling method"""
-        self._check_robots_txt()
-        
-        sitemap_urls = self._parse_sitemap()
-        if sitemap_urls:
-            for url in sitemap_urls[:self.max_pages]:
-                if url not in self.visited_urls and self._can_fetch(url):
-                    self._crawl_page(url, depth=0)
-        else:
-            self._crawl_page(self.base_url, depth=0)
-        
-        if not self.pages:
-            response = self._fetch_page(self.base_url)
-            if response and response.status_code == 200:
-                metadata = self._extract_metadata(self.base_url, response.text)
-                self.pages.append(metadata)
-        return self.pages
+    def _get_section_key(self, url: str) -> str:
+        """Extract first path segment for section dominance tracking"""
+        parsed = urlparse(url)
+        path = parsed.path.strip('/')
+        if not path:
+            return '/'
+        first_segment = path.split('/')[0]
+        return f'/{first_segment}'
     
-    def _crawl_page(self, url: str, depth: int = 0):
-        """Crawl a single page"""
-        if depth > self.max_depth or len(self.visited_urls) >= self.max_pages:
-            return
-        
-        if url in self.visited_urls:
-            return
-        
-        if not self._can_fetch(url):
-            return
-        
+    def _check_section_dominance(self, url: str) -> bool:
+        """Check if a URL's section exceeds 40% of crawled pages"""
+        if len(self.visited_urls) == 0:
+            return False
+        section_key = self._get_section_key(url)
+        section_count = self.section_counts[section_key]
+        total_crawled = len(self.visited_urls)
+        return (section_count / total_crawled) > 0.4
+    
+    def _crawl_page(self, url: str) -> Tuple[List[str], List[str]]:
+        """Crawl a single page and return (nav_links, other_links)"""
         if self.delay > 0:
             time.sleep(self.delay)
         
         response = self._fetch_page(url)
         
         if not response or response.status_code != 200:
-            return
+            return [], []
         
         content_type = response.headers.get('Content-Type', '').lower()
         if 'text/html' not in content_type and 'application/xhtml' not in content_type:
-            return
-        
-        self.visited_urls.add(url)
+            return [], []
         
         try:
             metadata = self._extract_metadata(url, response.text)
@@ -260,22 +250,113 @@ class WebCrawler:
                 'raw_text': extract_text_from_html(response.text, max_length=2000)
             })
         
-        if depth < self.max_depth and len(self.visited_urls) < self.max_pages:
-            try:
-                soup = BeautifulSoup(response.text, 'html.parser')
+        section_key = self._get_section_key(url)
+        self.section_counts[section_key] += 1
+        
+        nav_links = []
+        other_links = []
+        
+        try:
+            soup = BeautifulSoup(response.text, 'html.parser')
+            
+            nav_links = self._extract_navigation_links(soup, url)
+            internal_links = self._extract_internal_links(soup, url)
+            page_links = [l for l in internal_links if l not in nav_links and '/' in urlparse(l).path]
+            other_links = page_links[:30]
+        except Exception:
+            pass
+        
+        return nav_links, other_links
+    
+    def crawl(self) -> List[Dict]:
+        """
+        Main crawling method using priority-tier BFS.
+        Priority BFS: nav first, then other; dominance deferral bounded (max 3 deferrals per URL).
+        Strict FIFO order within each depth level.
+        """
+        self._check_robots_txt()
+        
+        self.defer_counts.clear()
+        MAX_DEFERS = 3
+        
+        nav_queues = [deque() for _ in range(self.max_depth + 1)]
+        other_queues = [deque() for _ in range(self.max_depth + 1)]
+        queued_urls: Set[str] = set()
+        
+        sitemap_urls = self._parse_sitemap()
+        if sitemap_urls:
+            for url in sitemap_urls[:self.max_pages]:
+                normalized = normalize_url(url)
+                if normalized not in self.visited_urls and normalized not in queued_urls and self._can_fetch(normalized):
+                    nav_queues[0].append(normalized)
+                    queued_urls.add(normalized)
+        else:
+            normalized_base = normalize_url(self.base_url)
+            nav_queues[0].append(normalized_base)
+            queued_urls.add(normalized_base)
+        
+        for depth in range(self.max_depth + 1):
+            while (nav_queues[depth] or other_queues[depth]) and len(self.visited_urls) < self.max_pages:
+                url = None
+                priority = None
                 
-                nav_links = self._extract_navigation_links(soup, url)
-                for link in nav_links:
-                    if link not in self.visited_urls and len(self.visited_urls) < self.max_pages:
-                        self._crawl_page(link, depth + 1)
+                # Priority BFS: nav first, then other (FIFO within each queue)
+                if nav_queues[depth]:
+                    url = nav_queues[depth].popleft()
+                    priority = 'nav'
+                elif other_queues[depth]:
+                    url = other_queues[depth].popleft()
+                    priority = 'other'
                 
-                if len(self.visited_urls) < self.max_pages:
-                    internal_links = self._extract_internal_links(soup, url)
-                    page_links = [l for l in internal_links if l not in nav_links and '/' in urlparse(l).path]
-                    links_to_follow = min(30, len(page_links))
-                    for link in page_links[:links_to_follow]:
-                        if link not in self.visited_urls and len(self.visited_urls) < self.max_pages:
-                            self._crawl_page(link, depth + 1)
-            except Exception:
-                pass
+                if not url:
+                    break
+                
+                queued_urls.discard(url)
+                
+                if url in self.visited_urls:
+                    continue
+                
+                if not self._can_fetch(url):
+                    continue
+                
+                # Bounded deferral: prevent infinite requeue loops
+                # If dominant section AND other priority AND not exceeded defer limit: requeue to back
+                if self._check_section_dominance(url) and priority == 'other':
+                    defer_count = self.defer_counts.get(url, 0)
+                    if defer_count < MAX_DEFERS:
+                        self.defer_counts[url] = defer_count + 1
+                        other_queues[depth].append(url)
+                        queued_urls.add(url)
+                        continue
+                
+                self.visited_urls.add(url)
+                
+                nav_links, other_links = self._crawl_page(url)
+                
+                if depth < self.max_depth and len(self.visited_urls) < self.max_pages:
+                    for link in nav_links:
+                        normalized = normalize_url(link)
+                        if (normalized not in self.visited_urls and 
+                            normalized not in queued_urls and
+                            len(self.visited_urls) < self.max_pages and
+                            self._can_fetch(normalized)):
+                            nav_queues[depth + 1].append(normalized)
+                            queued_urls.add(normalized)
+                    
+                    for link in other_links:
+                        normalized = normalize_url(link)
+                        if (normalized not in self.visited_urls and 
+                            normalized not in queued_urls and
+                            len(self.visited_urls) < self.max_pages and
+                            self._can_fetch(normalized)):
+                            other_queues[depth + 1].append(normalized)
+                            queued_urls.add(normalized)
+        
+        if not self.pages:
+            response = self._fetch_page(self.base_url)
+            if response and response.status_code == 200:
+                metadata = self._extract_metadata(self.base_url, response.text)
+                self.pages.append(metadata)
+        
+        return self.pages
 

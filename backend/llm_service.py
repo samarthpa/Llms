@@ -165,19 +165,56 @@ Return only the category name, nothing else."""
 Current llms.txt:
 {llms_content[:3000]}
 
-Provide the improved version, maintaining the same format but with better organization and descriptions."""
+IMPORTANT: Return ONLY the improved llms.txt content. Do not include any explanatory text, comments, or summaries. The response must start with "#" (the H1 heading) and contain only the llms.txt file content."""
 
             response = self.client.chat.completions.create(
                 model="gpt-4o-mini",
                 messages=[
-                    {"role": "system", "content": "You are a helpful assistant that improves llms.txt files according to the specification."},
+                    {"role": "system", "content": "You are a helpful assistant that improves llms.txt files according to the specification. Always return only the llms.txt content, no explanations."},
                     {"role": "user", "content": prompt}
                 ],
                 max_tokens=2000,
                 temperature=0.5
             )
             
-            return response.choices[0].message.content.strip()
+            improved = response.choices[0].message.content.strip()
+            
+            # Remove any explanatory text that might have been added
+            # Look for common patterns of explanatory text at the end
+            lines = improved.split('\n')
+            cleaned_lines = []
+            
+            # Common phrases that indicate explanatory text
+            explanatory_phrases = [
+                "this improved version",
+                "maintains the original format",
+                "enhancing clarity",
+                "better organization",
+                "improved version",
+                "note:",
+                "summary:",
+                "explanation:"
+            ]
+            
+            for line in lines:
+                line_lower = line.lower().strip()
+                # If we hit an explanatory line, stop adding lines
+                if any(phrase in line_lower for phrase in explanatory_phrases):
+                    # But only if it's not part of the actual content (not in a code block or list)
+                    if not line_lower.startswith('#') and not line_lower.startswith('-') and not line_lower.startswith('>'):
+                        break
+                cleaned_lines.append(line)
+            
+            cleaned = '\n'.join(cleaned_lines).strip()
+            
+            # Ensure it starts with H1 (valid llms.txt)
+            if cleaned.startswith('#'):
+                return cleaned
+            else:
+                # If LLM didn't return valid format, return original
+                logger.warning("LLM response doesn't start with H1, using original content")
+                return llms_content
+            
         except Exception as e:
             logger.error(f"Error improving llms.txt with LLM: {e}")
             return llms_content
